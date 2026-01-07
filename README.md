@@ -22,6 +22,7 @@
 
 ## 📢 Updates
 
+- **[2026-01-06]** Check out our [X thread](https://x.com/ShengguangWu/status/2008713289568596267)
 - **[2025-12-24]** Code released.
 - **[2025-12-23]** Paper available on [arXiv](https://arxiv.org/abs/2512.20934).
 
@@ -36,7 +37,7 @@ Create a conda environment and run the setup script:
 ```bash
 conda create -n tvp python=3.10 -y
 conda activate tvp
-bash setup_env.sh
+bash env_setup.sh
 ```
 
 ### API Key Setup
