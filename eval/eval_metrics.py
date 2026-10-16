@@ -147,6 +147,11 @@ class MetricEvaluator:
             "per_question_results": []
         }
         for result in results:
+            if (
+                result["meta_data"]["iteration_details"][iteration]["status"]
+                != "completed"
+            ):
+                continue
             question_idx = result["question_index"]
             gt = result["answer"]
             answer_type = result["answer_type"]
@@ -187,7 +192,9 @@ class MetricEvaluator:
         accuracies = {}
         for typ in ["yes_no", "multiple_choice", "numeric_count", "numeric_other"]:
             cat_data = metrics["categories"][typ]
-            accuracies[typ] = cat_data["correct"] / cat_data["total"]
+            accuracies[typ] = (
+                cat_data["correct"] / cat_data["total"] if cat_data["total"] else None
+            )
         total_exact_match = sum(
             metrics["categories"][typ]["correct"]
             for typ in ["yes_no", "multiple_choice", "numeric_count", "numeric_other"]
@@ -196,19 +203,24 @@ class MetricEvaluator:
             metrics["categories"][typ]["total"] 
             for typ in ["yes_no", "multiple_choice", "numeric_count", "numeric_other"]
         )
-        accuracies["overall_exact_match"] = total_exact_match / total_exact_match_questions
+        accuracies["overall_exact_match"] = (
+            total_exact_match / total_exact_match_questions
+            if total_exact_match_questions
+            else None
+        )
         num_other_data = metrics["categories"]["numeric_other"]
-        accuracies["numeric_other_mra"] = num_other_data["mra_sum"] / num_other_data["total"]
+        accuracies["numeric_other_mra"] = (
+            num_other_data["mra_sum"] / num_other_data["total"]
+            if num_other_data["total"]
+            else None
+        )
         metrics["accuracies"] = accuracies
         return metrics
     
     def evaluate_all_iterations(self, data):
         results = data["results"]
         summary = data["summary"]
-        iterations = set()
-        for result in results:
-            iterations.update(result["pred_answer"].keys())
-        iterations = sorted(list(iterations))
+        iterations = [f"iter{i}" for i in range(1, summary["iterations"] + 1)]
         evaluation = {
             "summary": summary,
             "iterations": iterations,
@@ -217,6 +229,9 @@ class MetricEvaluator:
         }
         for iteration in iterations:
             evaluation["metrics_by_iteration"][iteration] = self.evaluate_iteration(results, iteration)
+            evaluation["metrics_by_iteration"][iteration].update(
+                summary["progress"][iteration]
+            )
         comparison = {
             "execution_success_rate": {},
             "accuracies": {
@@ -272,7 +287,9 @@ def print_results(evaluation):
     for iter_name in iterations:
         print(f"\n{iter_name.upper()}:")
         metrics = evaluation["metrics_by_iteration"][iter_name]
-        print(f"  Total Questions: {metrics['total_questions']}")
+        print(
+            f"  Completed / planned: {metrics['completed']} / {metrics['planned']}; partial: {metrics['partial']}"
+        )
         print(f"  Execution Failures: {metrics['execution_failures']}")
         print("\n  Category Breakdown:")
         for typ, data in metrics["categories"].items():
@@ -311,13 +328,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--run-id", type=str, required=True,
                         help="Run ID to evaluate")
-    parser.add_argument("--results-path", type=str, default="./eval/extracted_results",
-                        help="Path to extracted results directory")
-    parser.add_argument("--output-path", type=str, default="./eval/metrics",
-                        help="Path to output directory")
+    parser.add_argument("--results-path", type=str, default="./output",
+                        help="Path to experiment root directory")
     args = parser.parse_args()
     
-    results_file = Path(args.results_path) / f"{args.run_id}.json"
+    run_dir = Path(args.results_path) / args.run_id
+    results_file = run_dir / "eval/extracted_results.json"
     with open(results_file) as f:
         data = json.load(f)
     
@@ -325,5 +341,5 @@ if __name__ == "__main__":
     evaluation = evaluator.evaluate_all_iterations(data)
     print_results(evaluation)
     
-    output_dir = Path(args.output_path) / args.run_id
+    output_dir = run_dir / "eval/metrics"
     save_results_csv(evaluation, output_dir)

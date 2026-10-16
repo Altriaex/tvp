@@ -3,6 +3,8 @@ main pipeline orchestrator for TVP.
 """
 import json
 from tqdm import tqdm
+import shutil
+import numpy as np
 import random
 from datetime import datetime
 
@@ -48,7 +50,7 @@ class Pipeline:
         self.example_library.set_tool_library(self.tool_library)    # connect libraries (for resume)
         self.clustering_engine = ClusteringEngine(self.config)
         self.execution_engine = ExecutionEngine(self.config)
-        self.execution_validator = ExecutionValidator(self.config)
+        self.execution_validator = ExecutionValidator(self.config, self.execution_engine)
         self.correctness_validator = CorrectnessValidator(self.config)
         self.rewriter = ProgramRewriter(self.config)
         self.parallel_executor = ParallelExecutor(self.config)
@@ -87,14 +89,37 @@ class Pipeline:
         logger.info(f"Initialized with {len(self.tool_library.get_all_tools())} tools")
         self.correctness_validator.set_tool_library(self.tool_library)
     
+    def _save_progress(self):
+        self.state.examples = self.example_library.examples.copy()
+        self.state.tools = self.tool_library.get_all_tools_including_deprecated()
+        self.state.embedding_cache = {
+            question: embedding.tolist()
+            for question, embedding in self.example_library._question_embedding_cache.items()
+        }
+        self.state.save()
+
     def run(self):
         logger.info("🚀 Starting pipeline")
         start_time = datetime.now()
+        questions = self._load_questions(
+            min(self.state.current_iteration, self.config.num_iterations)
+        )
+        stop = (self.config.stop_iteration, self.config.stop_position)
+        if stop[0] is not None and not (
+            1 <= stop[0] <= self.config.num_iterations
+            and 1 <= stop[1] <= len(questions)
+        ):
+            raise ValueError("Stop position is outside the experiment range")
         log_resume_info(self.state.current_iteration, self.state.questions_processed)
         for iteration in range(self.state.current_iteration, self.config.num_iterations + 1):
+            if stop[0] is not None and iteration > stop[0]:
+                break
             self._run_iteration(iteration)
-        cache_path = self.state.state_dir / "embedding_cache.json"
-        self.example_library.save_embedding_cache(cache_path)
+        logger.info(
+            "Experiment complete"
+            if self.state.current_iteration > self.config.num_iterations
+            else "Segment complete; experiment remains incomplete"
+        )
         log_final_summary(
             self.state.questions_processed,
             len(self.state.examples),
@@ -105,116 +130,145 @@ class Pipeline:
     def _run_iteration(self, iteration):
         logger.info(f"🔄 Starting iteration {iteration}")
         log_iteration_start(iteration, self.config.num_iterations)
-        self.state.current_iteration = iteration
         questions = self._load_questions(iteration)
-        # track already processed questions (resuming)
-        iteration_tracker_path = self.state.state_dir / f"iteration_{iteration}_tracker.json"
-        processed_in_this_iteration = set()
-        iteration_questions_processed = 0
-        if iteration_tracker_path.exists():
-            with open(iteration_tracker_path) as f:
-                tracker_data = json.load(f)
-                processed_in_this_iteration = set(tracker_data.get('processed_indices', []))
-                iteration_questions_processed = tracker_data.get('count', 0)
-                logger.info(f"Resuming iteration {iteration} - Already processed {iteration_questions_processed} questions")
-        questions_to_process = [q for q in questions if q.question_index not in processed_in_this_iteration]
-        pbar = tqdm(questions_to_process, 
-                desc=f"Iteration {iteration} - Processing questions",
-                initial=iteration_questions_processed + 1,
-                total=len(questions))
-        questions_in_iteration_start = self.state.questions_processed
-        for question in questions:
-            if question.question_index in processed_in_this_iteration:
+        completed = self.state.completed_questions.setdefault(str(iteration), [])
+        pbar = tqdm(total=len(questions), initial=len(completed),
+                    desc=f"Iteration {iteration} - Processing questions")
+        for position, question in enumerate(questions, 1):
+            if (
+                self.config.stop_iteration == iteration
+                and position > self.config.stop_position
+            ):
+                pbar.close()
+                return
+            if question.question_index in completed:
                 logger.info(f"Skipping already processed question {question.question_index}")
                 continue
-            log_question_processing(question.question_index, question.question)
-            example = self._process_question(question, iteration) 
-            processed_in_this_iteration.add(question.question_index)
-            iteration_questions_processed += 1
-            self.state.questions_processed += 1
-            if example: # passed example quality threshold
-                self.example_library.add_example(example)   # add to example lib
-                log_question_complete(question.question_index, True, example.quality_rating)
+            question_dir = (
+                self.config.results_dir
+                / f"iterations/iteration_{iteration}/questions/q_{question.question_index}"
+            )
+            answer_path = question_dir / "answer_complete.json"
+            # Completed answers are independent of the subsequent library updates.
+            if answer_path.exists():
+                with open(answer_path) as f:
+                    answer = json.load(f)
+                example_data = answer["example"]
+                if example_data is not None:
+                    example_data["question"] = Question(**example_data["question"])
+                    example_data["question_embedding"] = np.array(
+                        example_data["question_embedding"]
+                    )
+                    example = Example(**example_data)
+                else:
+                    example = None
             else:
-                log_question_complete(question.question_index, False)
-            self.state.examples = self.example_library.examples.copy()
-            # check for abstraction interval after processing the question
-            questions_since_iteration_start = self.state.questions_processed - questions_in_iteration_start
-            if (self.config.abstraction_interval > 0 and 
-                questions_since_iteration_start > 0 and
-                questions_since_iteration_start % self.config.abstraction_interval == 0):
-                logger.info(f"🎯 Abstraction interval triggered after processing question {question.question_index}")
-                interval_number = questions_since_iteration_start // self.config.abstraction_interval
-                self._abstract_and_deduplicate(iteration, interval_num=interval_number)
-            # check for deduplication interval after processing the question
-            if (self.config.enable_deduplication and 
-                self.config.deduplication_interval > 0 and
-                questions_since_iteration_start > 0 and
-                questions_since_iteration_start % self.config.deduplication_interval == 0):
-                logger.info(f"🎯 Deduplication interval triggered after processing question {question.question_index}")
-                interval_number = questions_since_iteration_start // self.config.deduplication_interval
-                self._perform_deduplication(iteration, interval_num=interval_number)
-            if pbar:
-                pbar.update(1)
-            # save iteration tracker of processed question (incl. abstraction/deduplication)
-            iteration_tracker_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(iteration_tracker_path, 'w') as f:
-                json.dump({
-                    'iteration': iteration,
-                    'count': iteration_questions_processed,
-                    'processed_indices': list(processed_in_this_iteration)
-                }, f, ensure_ascii=False)
-            self.state.save()
-            # save embedding cache
-            cache_path = self.state.state_dir / "embedding_cache.json"
-            self.example_library.save_embedding_cache(cache_path)
-        if pbar:
-            pbar.close()
-        # clean up iteration tracker after entire iter is complete
-        if iteration_questions_processed == len(questions):
-            if iteration_tracker_path.exists():
-                iteration_tracker_path.unlink()
-                logger.info(f"Removed completed iteration tracker for iteration {iteration}")
-        # save state after iter completion
-        self.state.save()
+                # Only the pending, unanswered question is replaced, never completed results.
+                if question_dir.exists():
+                    shutil.rmtree(question_dir)
+                log_question_processing(question.question_index, question.question)
+                example = self._process_question(question, iteration)
+                example_data = None
+                if example is not None:
+                    example_data = dict(example.__dict__)
+                    example_data["question"] = example.question.__dict__
+                    example_data["question_embedding"] = (
+                        example.question_embedding.tolist()
+                    )
+                pending = answer_path.with_suffix(".pending")
+                with open(pending, "w") as f:
+                    json.dump(
+                        {
+                            "iteration": iteration,
+                            "question_index": question.question_index,
+                            "example": example_data,
+                        },
+                        f,
+                        ensure_ascii=False,
+                    )
+                pending.replace(answer_path)
+            # Commit each update stage together with its corresponding libraries.
+            if self.state.pending_stage == "answer":
+                if example is not None:
+                    self.example_library.add_example(example)   # add to example lib
+                self.state.questions_processed += 1
+                self.state.pending_stage = "abstraction"
+                self._save_progress()
+            if self.state.pending_stage == "abstraction":
+                if (self.config.abstraction_interval > 0 and position % self.config.abstraction_interval == 0):
+                    logger.info(f"🎯 Abstraction interval triggered after processing question {question.question_index}")
+                    output = (
+                        self.config.results_dir
+                        / f"abstraction/iteration_{iteration}_interval_{len(self.state.abstraction_intervals) + 1}"
+                    )
+                    if output.exists():
+                        shutil.rmtree(output)
+                    self._abstract_and_deduplicate(
+                        iteration, position // self.config.abstraction_interval
+                    )
+                self.state.pending_stage = "deduplication"
+                self._save_progress()
+            if self.state.pending_stage == "deduplication":
+                if (self.config.enable_deduplication and
+                    self.config.deduplication_interval > 0 and position % self.config.deduplication_interval == 0):
+                    logger.info(f"🎯 Deduplication interval triggered after processing question {question.question_index}")
+                    output = (
+                        self.config.results_dir
+                        / f"deduplication/iteration_{iteration}_interval_{len(self.state.deduplication_intervals) + 1}"
+                    )
+                    if output.exists():
+                        shutil.rmtree(output)
+                    self._perform_deduplication(
+                        iteration, position // self.config.deduplication_interval
+                    )
+                completed.append(question.question_index)
+                self.state.pending_stage = "answer"
+                if position == len(questions):
+                    self.state.current_iteration = iteration + 1
+                self._save_progress()
+            log_question_complete(
+                question.question_index,
+                example is not None,
+                example.quality_rating if example is not None else None,
+            )
+            pbar.update(1)
+        pbar.close()
         logger.info(f"✅ Completed iteration {iteration}")
     
     def _load_questions(self, iteration):
-        sampled_questions_path = self.config.results_dir / "sampled_questions.json" # check if existing sampled questions exist (resuming)
-        if sampled_questions_path.exists():
-            logger.info(f"Loading existing sampled questions from {sampled_questions_path}")
-            with open(sampled_questions_path) as f:
-                questions_data = json.load(f)
-            questions = []
-            for q_data in questions_data:
-                questions.append(Question(**q_data))
-            if self.config.reorder_questions_per_iteration:
-                random.seed(self.config.random_seed + iteration)
-                questions = random.sample(questions, len(questions))
-                logger.info(f"Applied random ordering for iteration {iteration}")
-            logger.info(f"Loaded {len(questions)} pre-sampled questions")
-            return questions
-        logger.info("No sampled questions found, loading from annotations") # no sampled questions exist - load from dataset source annotations
-        with open(self.config.annotations_path) as f:
-            all_questions_data = json.load(f)
-        if isinstance(all_questions_data, list):
-            questions_list = all_questions_data
-        elif isinstance(all_questions_data, dict) and 'questions' in all_questions_data:
-            questions_list = all_questions_data['questions']
-        all_questions = []
-        for q_data in questions_list:
-            all_questions.append(Question(**q_data))
-        if self.config.reorder_questions_per_iteration:
-            random.seed(self.config.random_seed + iteration)
-            sorted_questions = random.sample(all_questions, len(all_questions))
+        sampled_path = self.config.results_dir / "sampled_questions.json"
+        if sampled_path.exists():
+            with open(sampled_path) as f:
+                selected = json.load(f)
         else:
-            sorted_questions = all_questions
-        num_to_process = self.config.num_questions if self.config.num_questions > 0 else len(sorted_questions)
-        selected_questions = sorted_questions[:num_to_process]
-        sampled_questions_path = self.config.results_dir / "sampled_questions.json" # save sampled questions for resume
-        with open(sampled_questions_path, 'w') as f:
-            json.dump([q.__dict__ for q in selected_questions], f, indent=2, ensure_ascii=False)
-        return selected_questions
+            with open(self.config.annotations_path) as f:
+                data = json.load(f)
+            selected = data if isinstance(data, list) else data['questions']
+            if self.config.reorder_questions_per_iteration:
+                selected = random.Random(self.config.random_seed + iteration).sample(selected, len(selected))
+            if self.config.num_questions > 0:
+                selected = selected[:self.config.num_questions]
+            pending = sampled_path.with_suffix(".pending")
+            with open(pending, 'w') as f:
+                json.dump(selected, f, indent=2, ensure_ascii=False)
+            pending.replace(sampled_path)
+        # Every iteration starts from the same collection, never a shuffled predecessor.
+        order_path = self.state.state_dir / f"iteration_{iteration}_order.json"
+        by_id = {q["question_index"]: q for q in selected}
+        if order_path.exists():
+            with open(order_path) as f:
+                order = json.load(f)
+        else:
+            order = list(by_id)
+            if self.config.reorder_questions_per_iteration and iteration > 1:
+                order = random.Random(self.config.random_seed + iteration).sample(
+                    order, len(order)
+                )
+            pending = order_path.with_suffix(".pending")
+            with open(pending, "w") as f:
+                json.dump(order, f)
+            pending.replace(order_path)
+        return [Question(**by_id[index]) for index in order]
 
     def _process_question(self, question, iteration):
         question_dir = (self.config.results_dir / f"iterations/iteration_{iteration}/questions/q_{question.question_index}")
@@ -358,7 +412,8 @@ class Pipeline:
                     'candidate_index': original_candidate.candidate_index,
                     'quality_rating': None,
                     'quality_reasoning': 'Not judged due to execution failure or None result',
-                    'execution_success': False,
+                    'execution_success': not original_candidate.execution_error and original_candidate.answer is not None,
+                    'judging_status': 'failed' if original_candidate.answer is not None and not original_candidate.execution_error else 'not_started',
                     'execution_error': original_candidate.execution_error
                 })
         with open(judging_dir / "scores.json", 'w') as f:
@@ -390,6 +445,8 @@ class Pipeline:
             'question_index': all_candidates[0].question.question_index if all_candidates else None,
             'question': all_candidates[0].question.question if all_candidates else None,
             'total_candidates': len(all_candidates),
+            "planned_candidates": self.config.programs_per_question,
+            "generation_failures": self.config.programs_per_question - len(all_candidates),
             'successful_executions': len([c for c in all_candidates if not c.execution_error and c.answer is not None]),
             'timestamp': datetime.now().isoformat()
         }
@@ -460,7 +517,6 @@ class Pipeline:
             interval.completed_at = datetime.now().isoformat()
             self.state.abstraction_intervals.append(interval)
             self.state.abstraction_intervals_completed = len(self.state.abstraction_intervals)
-            self.state.save()
             return
         log_clustering_result(global_interval_number,
             final_clustering_log['initial_groups'],
@@ -474,7 +530,6 @@ class Pipeline:
         interval.completed_at = datetime.now().isoformat()
         self.state.abstraction_intervals.append(interval)
         self.state.abstraction_intervals_completed = len(self.state.abstraction_intervals)
-        self.state.save()
         logger.info(f"✅ Completed Abstraction Interval #{global_interval_number} - Created {interval.tools_created} tools from {interval.clusters_found} clusters")
     
     def _cluster_examples(self, output_dir):
@@ -608,7 +663,6 @@ class Pipeline:
             json.dump(abstraction_summary, f, indent=2, ensure_ascii=False)
         updates_dir = output_dir / "example_updates"
         self.example_library.save_update_history(updates_dir)
-        self.state.save()
     
     def _abstract_cluster(self, cluster, abstraction_dir):
         cluster_dir = abstraction_dir / f"tools/cluster_{cluster.id}"
@@ -884,7 +938,6 @@ class Pipeline:
             json.dump(dedup_summary, f, indent=2, ensure_ascii=False)
         self.state.deduplication_intervals.append(interval)
         self.state.deduplication_rounds = len(self.state.deduplication_intervals)
-        self.state.save()
 
     def _merge_tools_with_retry(self, tools_to_merge, merge_strategy, merge_strategy_reason, output_dir):
         output_dir.mkdir(parents=True, exist_ok=True)

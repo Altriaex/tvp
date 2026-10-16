@@ -3,3 +3,8 @@ __pycache__/
 data/
 models/
 results/
+
+.venv/
+.setup/
+.env
+output/

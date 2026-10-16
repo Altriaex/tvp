@@ -2,6 +2,7 @@
 example and tool libraries in TVP.
 """
 import json
+from openai import APIConnectionError
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -158,6 +159,8 @@ class ExampleLibrary:
             })
             if judged_candidate and judged_candidate.quality_rating is not None:
                 return judged_candidate.quality_rating
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to re-evaluate quality: {e}")
         return None

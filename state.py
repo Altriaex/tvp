@@ -18,6 +18,9 @@ class PipelineState:
         # initialize
         self.current_iteration = 1
         self.questions_processed = 0
+        self.completed_questions = {}
+        self.pending_stage = "answer"
+        self.embedding_cache = {}
         self.abstraction_intervals_completed = 0
         self.deduplication_rounds = 0
         self.examples = []
@@ -31,9 +34,33 @@ class PipelineState:
             self.load()
     
     def save(self):
+        state_dir = self.state_dir
+        pending = state_dir / ".pending"
+        pending.mkdir(exist_ok=True)
+        self.state_dir = pending
+        try:
+            self._write_state()
+        finally:
+            self.state_dir = state_dir
+        pending.rename(state_dir / ".commit")
+        self._finish_commit()
+
+    def _finish_commit(self):
+        # Finish a published commit before reading any state files after a restart.
+        commit = self.state_dir / ".commit"
+        if commit.exists():
+            for path in commit.iterdir():
+                path.replace(self.state_dir / path.name)
+            commit.rmdir()
+
+    def _write_state(self):
         checkpoint = {
             'current_iteration': self.current_iteration,
             'questions_processed': self.questions_processed,
+            "completed_questions": self.completed_questions,
+            "pending_stage": self.pending_stage,
+            "stop_iteration": self.config.stop_iteration,
+            "stop_position": self.config.stop_position,
             'abstraction_intervals_completed': self.abstraction_intervals_completed,
             'deduplication_rounds': self.deduplication_rounds,
             'timestamp': get_timestamp()
@@ -45,15 +72,26 @@ class PipelineState:
         self._save_clusters()
         self._save_abstraction_intervals()
         self._save_deduplication_intervals()
+        with open(self.state_dir / "embedding_cache.json", "w") as f:
+            json.dump(
+                {
+                    "embedding_model": self.config.embedding_model,
+                    "embeddings": self.embedding_cache,
+                },
+                f,
+            )
         get_logger(__name__).debug("State saved successfully")
     
     def load(self):
+        self._finish_commit()
         checkpoint_path = self.state_dir / "checkpoint.json"
         if checkpoint_path.exists():
             with open(checkpoint_path) as f:
                 checkpoint = json.load(f)
             self.current_iteration = checkpoint.get('current_iteration', 1)
             self.questions_processed = checkpoint.get('questions_processed', 0)
+            self.completed_questions = checkpoint["completed_questions"]
+            self.pending_stage = checkpoint["pending_stage"]
             self.abstraction_intervals_completed = checkpoint.get('abstraction_intervals_completed', 0)
             self.deduplication_rounds = checkpoint.get('deduplication_rounds', 0)
             get_logger(__name__).info(f"Loaded checkpoint - Iteration: {self.current_iteration}, Questions: {self.questions_processed}")

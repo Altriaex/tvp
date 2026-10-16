@@ -4,9 +4,9 @@ main entry point for TVP library building pipeline.
 import argparse
 import sys
 import os
+import tempfile
 
 from config import create_config_from_args
-from pipeline import Pipeline
 from logging_utils import setup_logging, log_config
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -25,12 +25,10 @@ def main():
                        help="path to image directory")
     parser.add_argument("--models-path", type=str, default="./models/",
                        help="path to vision tool model directory")
-    parser.add_argument("--results-path", type=str, default="./results/",
+    parser.add_argument("--results-path", type=str, default="./output/",
                        help="path to results directory")
-    parser.add_argument("--api-key-path", type=str, default="./api.key",
-                       help="path to openai api key file")
     # predefined model selection
-    parser.add_argument("--vqa-model", type=str, default="gpt-4o",
+    parser.add_argument("--vqa-model", type=str, default=os.environ.get("TVP_VQA_MODEL", "Qwen3.8-Flash-Next"),
                        help="vqa model variant")
     parser.add_argument("--grounding-model", type=str, default="groundingdino_swint_ogc", choices=["groundingdino_swint_ogc", "groundingdino_swinb_cogcoor"],
                        help="groundingdino model variant")
@@ -60,7 +58,7 @@ def main():
                        help="minimum similarity for example retrieval")
     parser.add_argument("--max-retrieved-examples", type=int, default=3,
                        help="maximum examples to retrieve")
-    parser.add_argument("--embedding-model", type=str, default="BAAI/bge-large-en-v1.5",
+    parser.add_argument("--embedding-model", type=str, default="./models/checkpoints/bge-large-en-v1.5",
                        help="embedding model for question text similarity")
     # clustering and abstraction
     parser.add_argument("--abstraction-interval", type=int, default=10,
@@ -101,21 +99,21 @@ def main():
     parser.add_argument("--update-examples-after-deduplication", type=bool, default=True,
                        help="update example implementations in exmaple library after successful tool deduplication")
     # model selection
-    parser.add_argument("--program-model", type=str, default="gpt-4o",
+    parser.add_argument("--program-model", type=str, default=os.environ.get("TVP_PROGRAM_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for program generation")
-    parser.add_argument("--judge-model", type=str, default="gpt-4o",
+    parser.add_argument("--judge-model", type=str, default=os.environ.get("TVP_JUDGE_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for quality judging")
-    parser.add_argument("--cluster-model", type=str, default="o4-mini",
+    parser.add_argument("--cluster-model", type=str, default=os.environ.get("TVP_CLUSTER_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for cluster analysis -> reasoning models highly recommended")
-    parser.add_argument("--abstraction-model", type=str, default="o4-mini",
+    parser.add_argument("--abstraction-model", type=str, default=os.environ.get("TVP_ABSTRACTION_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for tool abstraction")
-    parser.add_argument("--deduplication-model", type=str, default="o4-mini",
+    parser.add_argument("--deduplication-model", type=str, default=os.environ.get("TVP_DEDUPLICATION_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for tool deduplication")
-    parser.add_argument("--correctness-model", type=str, default="gpt-4o",
+    parser.add_argument("--correctness-model", type=str, default=os.environ.get("TVP_CORRECTNESS_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for correctness validation")
-    parser.add_argument("--rewrite-model", type=str, default="o4-mini",
+    parser.add_argument("--rewrite-model", type=str, default=os.environ.get("TVP_REWRITE_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for program rewriting")
-    parser.add_argument("--merge-model", type=str, default="o4-mini",
+    parser.add_argument("--merge-model", type=str, default=os.environ.get("TVP_MERGE_MODEL", "Qwen3.8-Flash-Next"),
                        help="model for tool merging")
     # temperatures
     parser.add_argument("--temperature-program", type=float, default=1.0,
@@ -145,18 +143,37 @@ def main():
                        help="timeout (sec) for program execution")
     parser.add_argument("--save-exe-trace", action="store_true",
                        help="save full execution trace as html files for each program exeuction")
+    parser.add_argument(
+        "--stop-iteration", type=int, help="inclusive stopping iteration (1-based)"
+    )
+    parser.add_argument(
+        "--stop-position",
+        type=int,
+        help="inclusive position in saved iteration order (1-based)",
+    )
     args = parser.parse_args()
+    if (args.stop_iteration is None) != (args.stop_position is None):
+        parser.error("--stop-iteration and --stop-position must be supplied together")
     # create config instance
     config = create_config_from_args(args)
+    # Set temporary storage before importing model and execution modules.
+    tmp_dir = config.results_dir.resolve() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(tmp_dir)
+    tempfile.tempdir = str(tmp_dir)
     # setup logging
     setup_logging(config)
     log_config(config)
     # create and run pipeline
-    pipeline = Pipeline(config)
     try:
+        from pipeline import Pipeline
+
+        pipeline = Pipeline(config)
         pipeline.run()
     except KeyboardInterrupt:
-        print("\n\nPipeline interrupted. State has been saved.")
+        print(
+            "\n\nPipeline interrupted. Resume from the last persisted stage with the original command."
+        )
         sys.exit(1)
     except Exception as e:
         print(f"\n\nPipeline failed with error: {e}")

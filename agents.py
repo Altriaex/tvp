@@ -3,6 +3,7 @@ llm agentic components in TVP
 """
 import re
 import json
+from openai import APIConnectionError
 from pathlib import Path
 import base64
 from PIL import Image
@@ -28,7 +29,9 @@ class BaseAgent:
     
     def _save_response(self, response, output_dir, filename="response.txt"):
         with open(output_dir / filename, 'w') as f:
-            f.write(response)
+            f.write(response["content"] or "")
+        with open((output_dir / filename).with_suffix(".json"), "w") as f:
+            json.dump(response, f, indent=2, ensure_ascii=False)
     
     def _save_json(self, data, output_dir, filename="data.json"):
         with open(output_dir / filename, 'w') as f:
@@ -62,6 +65,7 @@ class ProgramGenerator(BaseAgent):
                 temperature=self.config.temperature_program
             )
             self._save_response(response, output_dir, f"response_{index}.txt")
+            response = response["content"]
             code = extract_code(response, return_nan=True)
             if code:
                 candidate = ProgramCandidate(
@@ -72,14 +76,37 @@ class ProgramGenerator(BaseAgent):
                 self._save_json({
                     'question_index': question.question_index,
                     'candidate_index': index,
+                    'status': 'completed',
                     'code': code,
                     'model': self.model
                 }, output_dir, f"candidate_{index}.json")
                 return candidate
             else:
+                self._save_json(
+                    {
+                        "question_index": question.question_index,
+                        "candidate_index": index,
+                        "status": "failed",
+                        "error": "No code extracted",
+                    },
+                    output_dir,
+                    f"candidate_{index}.json",
+                )
                 self.logger.warning(f"Failed to extract code for candidate {index}")
                 return None
+        except APIConnectionError:
+            raise
         except Exception as e:
+            self._save_json(
+                {
+                    "question_index": question.question_index,
+                    "candidate_index": index,
+                    "status": "failed",
+                    "error": str(e),
+                },
+                output_dir,
+                f"candidate_{index}.json",
+            )
             self.logger.error(f"Failed to generate program: {e}")
             self.logger.debug(traceback.format_exc())
             return None
@@ -119,6 +146,7 @@ class QualityJudge(BaseAgent):
                 temperature=self.config.temperature_judge
             )
             self._save_response(response, output_dir)
+            response = response["content"]
             rating, reasoning = self._parse_judgment(response)
             candidate.quality_rating = rating
             candidate.quality_reasoning = reasoning
@@ -137,7 +165,19 @@ class QualityJudge(BaseAgent):
                 reasoning
             )
             return candidate
+        except APIConnectionError:
+            raise
         except Exception as e:
+            self._save_json(
+                {
+                    "question_index": candidate.question.question_index,
+                    "candidate_index": candidate.candidate_index,
+                    "status": "failed",
+                    "error": str(e),
+                },
+                output_dir,
+                "judgment.json",
+            )
             self.logger.error(f"Failed to judge program: {e}")
             self.logger.debug(traceback.format_exc())
             return None
@@ -174,6 +214,7 @@ class ClusterAnalyzer(BaseAgent):
                 temperature=self.config.temperature_cluster
             )
             self._save_response(response, output_dir)
+            response = response["content"]
             clusters = self._parse_clusters(response, self.config.min_cluster_size)
             self._save_json({
                 'group_size': len(examples),
@@ -181,6 +222,8 @@ class ClusterAnalyzer(BaseAgent):
                 'clusters': [c.to_dict() for c in clusters]
             }, output_dir, "cluster_analysis.json")
             return clusters
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to analyze cluster: {e}")
             return []
@@ -256,6 +299,7 @@ class ToolAbstractor(BaseAgent):
                 temperature=self.config.temperature_abstraction
             )
             self._save_response(response, output_dir, response_filename)
+            response = response["content"]
             tool = self._parse_tool(response, existing_tools)
             if tool:
                 self._save_json({
@@ -271,6 +315,8 @@ class ToolAbstractor(BaseAgent):
             else:
                 self.logger.warning("Failed to parse tool from response")
             return tool
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to abstract tool: {e}")
             self.logger.debug(traceback.format_exc())
@@ -344,6 +390,7 @@ class ToolDeduplicator(BaseAgent):
                 temperature=self.config.temperature_deduplication
             )
             self._save_response(response, output_dir)
+            response = response["content"]
             all_merge_groups = self._parse_merge_groups(response, tools, filter_by_threshold=False)
             with open(output_dir / "all_merge_groups.json", 'w') as f:
                 json.dump({
@@ -358,6 +405,8 @@ class ToolDeduplicator(BaseAgent):
                 'merge_groups': merge_groups
             }, output_dir, "duplicate_analysis.json")
             return merge_groups
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to find duplicates: {e}")
             return []
@@ -386,6 +435,7 @@ class ToolDeduplicator(BaseAgent):
                 temperature=self.config.temperature_merge
             )
             self._save_response(response, output_dir)
+            response = response["content"]
             merged_tool = self._parse_merged_tool(response, tools)
             if merged_tool:
                 self._save_json({
@@ -395,6 +445,8 @@ class ToolDeduplicator(BaseAgent):
                 }, output_dir, "merged_tool.json")
                 self.logger.info(f"To merge {len(tools)} tools: {', '.join([t.name for t in tools])} --into--> {merged_tool.name}")
             return merged_tool
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to merge tools: {e}")
             return None
@@ -507,6 +559,7 @@ class CorrectnessJudge(BaseAgent):
                 temperature=self.config.temperature_correctness
             )
             self._save_response(response, output_dir)
+            response = response["content"]
             verdict, reasoning = self._parse_verdict(response)
             result = {
                 'example_id': detail['example_id'],
@@ -518,6 +571,8 @@ class CorrectnessJudge(BaseAgent):
             }
             self._save_json(result, output_dir, "correctness_judgment.json")
             return result
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to judge correctness: {e}")
             return {

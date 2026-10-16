@@ -112,8 +112,9 @@ def log_config(config):
         'config': config_dict
     }})
     config_path = config.results_dir / "metadata.json" # save to file for resumability
-    with open(config_path, 'w') as f:
-        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+    if not config_path.exists():
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
 def log_iteration_start(iteration, total_iterations):
     logger = log_module.getLogger('pipeline')
@@ -435,7 +436,7 @@ def log_resume_info(current_iteration, questions_processed):
 def log_final_summary(questions_processed, examples_collected, tools_total, execution_time):
     logger = log_module.getLogger('pipeline')
     logger.info(
-        f"\n{'='*80}\n=== PIPELINE COMPLETE ===\n{'='*80}",
+        f"\n{'='*80}\n=== PIPELINE RUN ENDED ===\n{'='*80}",
         extra={'section': 'final summary'}
     )
     logger.info(f"📊 Final Statistics:")

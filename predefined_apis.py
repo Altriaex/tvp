@@ -3,12 +3,18 @@ predefined tool APIs for Omni3D dataset
 """
 import time
 import base64
+import json
 import re
 from io import BytesIO
 from pathlib import Path
 import torch
 import numpy as np
 from PIL import Image
+from groundingdino.models import build_model
+from groundingdino.util.misc import clean_state_dict
+from groundingdino.util.slconfig import SLConfig
+from openai import APIConnectionError
+from unidepth.models import UniDepthV2
 
 from utils import LLMClient
 
@@ -29,7 +35,6 @@ class PredefinedModules:
     
     def _init_grounding_models(self):
         try:
-            from groundingdino.util.inference import load_model
             grounding_configs = {
                 "groundingdino_swint_ogc": "GroundingDINO_SwinT_OGC.py",
                 "groundingdino_swinb_cogcoor": "GroundingDINO_SwinB_cfg.py"
@@ -40,10 +45,25 @@ class PredefinedModules:
             }
             config_file = grounding_configs.get(self.config.grounding_model, "GroundingDINO_SwinT_OGC.py")
             weight_file = grounding_weights.get(self.config.grounding_model, "groundingdino_swint_ogc.pth")
-            self.grounding_dino = load_model(
-                f"{self.config.models_path}/GroundingDINO/groundingdino/config/{config_file}",
-                f"{self.config.models_path}/GroundingDINO/weights/{weight_file}"
+            # Use the upstream model configuration with local text and detector weights.
+            models_path = Path(self.config.models_path).resolve()
+            model_args = SLConfig.fromfile(
+                str(models_path / "GroundingDINO/groundingdino/config" / config_file)
             )
+            model_args.device = self.device
+            model_args.text_encoder_type = str(
+                models_path / "checkpoints/bert-base-uncased"
+            )
+            self.grounding_dino = build_model(model_args)
+            checkpoint = torch.load(
+                models_path / "checkpoints/groundingdino" / weight_file,
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.grounding_dino.load_state_dict(
+                clean_state_dict(checkpoint["model"]), strict=False
+            )
+            self.grounding_dino.eval()
             print(f"**SUCCESS**: loaded GroundingDINO: {weight_file}, box_threshold: {self.config.grounding_model_box_threshold}, text_threshold: {self.config.grounding_model_text_threshold}")
         except Exception as e:
             print(f"**BUG**: Could not load GroundingDINO: {e}")
@@ -51,13 +71,14 @@ class PredefinedModules:
     
     def _init_depth_model(self):
         try:
-            from unidepth.models import UniDepthV2
-            depth_models = {
-                "unidepth-v2-vits14": "lpiccinelli/unidepth-v2-vits14",
-                "unidepth-v2-vitl14": "lpiccinelli/unidepth-v2-vitl14"
-            }
-            model_name = depth_models.get(self.config.depth_model, "lpiccinelli/unidepth-v2-vits14")
-            self.unidepth_model = UniDepthV2.from_pretrained(model_name).to(self.device)
+            model_name = str(
+                Path(self.config.models_path).resolve()
+                / "checkpoints"
+                / self.config.depth_model
+            )
+            self.unidepth_model = UniDepthV2.from_pretrained(
+                model_name, local_files_only=True
+            ).to(self.device)
             print(f"**SUCCESS**: loaded UniDepth: {model_name}")
         except Exception as e:
             print(f"**BUG**: Could not load UniDepth model: {e}")
@@ -217,11 +238,21 @@ class PredefinedModules:
                     img_base64, 
                     self.config.vqa_model, 
                     temperature=0.0)
+                response_path = (
+                    self.execution_output_dir
+                    / f"vqa_response_{self.vqa_call_index}.json"
+                )
+                self.vqa_call_index += 1
+                with open(response_path, "w") as f:
+                    json.dump(answer_text, f, indent=2, ensure_ascii=False)
+                answer_text = answer_text["content"]
                 match = re.search(r'<answer>(.*?)</answer>', answer_text, re.DOTALL | re.IGNORECASE)
                 if match:
                     return match.group(1).strip().lower()
                 else:
                     return answer_text.strip().lower()  # fallback if no tags found
+            except APIConnectionError:
+                raise
             except Exception as e:
                 print(f"VQA - API call failed (vqa attempt {attempt + 1}/{vqa_max_retries}): {e}")
                 if attempt < vqa_max_retries - 1:

@@ -6,11 +6,10 @@ import time
 import numpy as np
 import traceback
 from tqdm import tqdm
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
 from FlagEmbedding import FlagModel
 
 from models import Tool
@@ -111,12 +110,7 @@ class LLMClient:
     @property
     def client(self):
         if self._client is None:
-            api_key_path = Path(self.config.api_key_path)
-            if not api_key_path.exists():
-                raise FileNotFoundError(f"API key file not found: {api_key_path}")
-            with open(api_key_path, 'r') as f:
-                api_key = f.read().strip()
-            self._client = OpenAI(api_key=api_key)
+            self._client = OpenAI()
         return self._client
 
     def generate(self, prompt, model, temperature=1.0, reasoning_effort='medium', max_retries=3):
@@ -136,7 +130,13 @@ class LLMClient:
                         messages=messages,
                         temperature=temperature
                     )
-                return response.choices[0].message.content
+                return {
+                    "content": response.choices[0].message.content,
+                    "finish_reason": response.choices[0].finish_reason,
+                    "usage": response.usage.model_dump()
+                    if response.usage is not None
+                    else None,
+                }
             except Exception as e:
                 self.logger.warning(f"API call failed (attempt {attempt + 1}/{max_retries}), Error: {e}")
                 if attempt < max_retries - 1:
@@ -161,7 +161,13 @@ class LLMClient:
                     messages=messages,
                     temperature=temperature
                 )
-                return response.choices[0].message.content
+                return {
+                    "content": response.choices[0].message.content,
+                    "finish_reason": response.choices[0].finish_reason,
+                    "usage": response.usage.model_dump()
+                    if response.usage is not None
+                    else None,
+                }
             except Exception as e:
                 self.logger.warning(f"API call failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
@@ -216,6 +222,10 @@ class ParallelExecutor:
                 try:
                     result = future.result()
                     results[idx] = result
+                except APIConnectionError:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
                 except Exception as e:
                     self.logger.error(f"Task {idx} failed: {e}")
                     self.logger.debug(f"Traceback: {traceback.format_exc()}")

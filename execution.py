@@ -2,6 +2,7 @@
 program execution and validation components.
 """
 import json
+from openai import APIConnectionError
 import signal
 import runpy
 import traceback
@@ -31,6 +32,8 @@ class ExecutionEngine:
     def execute(self, candidate, tools, output_dir, image_path=None):
         output_dir.mkdir(parents=True, exist_ok=True)
         self.modules.clear_trace()
+        self.modules.execution_output_dir = output_dir
+        self.modules.vqa_call_index = 0
         exec_file = output_dir / "program.py"
         result_file = output_dir / "result.json"
         trace_file = output_dir / "trace.html"
@@ -57,44 +60,71 @@ class ExecutionEngine:
                 'error': error_msg,
                 'error_details': f"Attempted path: {image_path}"
             }
-        # 1. write executable
-        self._write_executable(exec_file, result_file, candidate.code, tools, str(image_path))  
-        namespace = {
-            "Path": Path,
-            **self.modules.get_all()    # add predefined functions
-        }
-        # 2. execute program (will save result file)
-        error_info = self._run_program(exec_file, namespace)
-        # 3. save execution trace (optional --> saving these html files will take up quite some disk space | but good for examining the programs & debugging)
-        if self.save_exe_trace:
-            self._save_trace(trace_file, candidate, error_info.get('error') if error_info else None)
-        # 4. write errors if any
-        if error_info:
-            with open(error_file, 'w') as f:
-                f.write(f"Error: {error_info['error']}\n")
-                f.write(f"Traceback:\n{error_info['traceback']}\n")
-            log_execution(
-                candidate.question.question_index,
-                candidate.candidate_index,
-                success=False,
-                error=error_info['error']
-            )
-            return {
-                'namespace': {},
-                'answer': None,
-                'error': error_info['error'],
-                'error_details': error_info['traceback']
+        try:
+            # 1. write executable
+            self._write_executable(exec_file, result_file, candidate.code, tools, str(image_path))
+            namespace = {
+                "Path": Path,
+                **self.modules.get_all()    # add predefined functions
             }
-        # 5. load results & log
-        if result_file.exists():
-            with open(result_file, 'r') as f:
-                result_namespace = json.load(f)
-            answer = result_namespace.get('final_result')    # extract answer formatted as per program generation prompt
-            if answer is None:  # check if answer is none --> treat as execution error
-                error_msg = "Program execution produced None result (final_result not set or is None)"
+            # 2. execute program (will save result file)
+            error_info = self._run_program(exec_file, namespace)
+            # 3. save execution trace (optional --> saving these html files will take up quite some disk space | but good for examining the programs & debugging)
+            if self.save_exe_trace:
+                self._save_trace(trace_file, candidate, error_info.get('error') if error_info else None)
+            # 4. write errors if any
+            if error_info:
                 with open(error_file, 'w') as f:
-                    f.write(f"Error: {error_msg}\n")
-                    f.write(f"Result namespace: {result_namespace}\n")
+                    f.write(f"Error: {error_info['error']}\n")
+                    f.write(f"Traceback:\n{error_info['traceback']}\n")
+                log_execution(
+                    candidate.question.question_index,
+                    candidate.candidate_index,
+                    success=False,
+                    error=error_info['error']
+                )
+                return {
+                    'namespace': {},
+                    'answer': None,
+                    'error': error_info['error'],
+                    'error_details': error_info['traceback']
+                }
+            # 5. load results & log
+            if result_file.exists():
+                with open(result_file, 'r') as f:
+                    result_namespace = json.load(f)
+                answer = result_namespace.get('final_result')    # extract answer formatted as per program generation prompt
+                if answer is None:  # check if answer is none --> treat as execution error
+                    error_msg = "Program execution produced None result (final_result not set or is None)"
+                    with open(error_file, 'w') as f:
+                        f.write(f"Error: {error_msg}\n")
+                        f.write(f"Result namespace: {result_namespace}\n")
+                    log_execution(
+                        candidate.question.question_index,
+                        candidate.candidate_index,
+                        success=False,
+                        error=error_msg
+                    )
+                    return {
+                        'namespace': result_namespace,
+                        'answer': None,
+                        'error': error_msg,
+                        'error_details': 'The program did not set final_result or set it to None'
+                    }
+                answer = normalize_answer(answer)
+                log_execution(
+                    candidate.question.question_index,
+                    candidate.candidate_index,
+                    success=True,
+                    answer=answer
+                )
+                return {
+                    'namespace': result_namespace,
+                    'answer': answer,
+                    'error': None
+                }
+            else:
+                error_msg = "No result file created"
                 log_execution(
                     candidate.question.question_index,
                     candidate.candidate_index,
@@ -102,36 +132,12 @@ class ExecutionEngine:
                     error=error_msg
                 )
                 return {
-                    'namespace': result_namespace,
+                    'namespace': {},
                     'answer': None,
-                    'error': error_msg,
-                    'error_details': 'The program did not set final_result or set it to None'
+                    'error': error_msg
                 }
-            answer = normalize_answer(answer)
-            log_execution(
-                candidate.question.question_index,
-                candidate.candidate_index,
-                success=True,
-                answer=answer
-            )
-            return {
-                'namespace': result_namespace,
-                'answer': answer,
-                'error': None
-            }
-        else:
-            error_msg = "No result file created"
-            log_execution(
-                candidate.question.question_index,
-                candidate.candidate_index,
-                success=False,
-                error=error_msg
-            )
-            return {
-                'namespace': {},
-                'answer': None,
-                'error': error_msg
-            }
+        finally:
+            self.modules.clear_trace()
     
     def _write_executable(self, exec_file, result_file, code, tools, image_path_str):
         """write executable program file"""
@@ -199,14 +205,16 @@ class ExecutionEngine:
         """execute a program file with timeout"""
         def timeout_handler(signum, frame):
             raise TimeoutError(f"Execution timed out after {self.timeout} seconds")
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
         try:
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(self.timeout)
             runpy.run_path(str(exec_file), init_globals=namespace)
-            signal.alarm(0)
             return None
+        except APIConnectionError:
+            raise
         except Exception as e:
-            signal.alarm(0)
             exc_type, exc_value, exc_traceback = sys.exc_info()
             tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
             full_traceback = ''.join(tb_lines)
@@ -214,6 +222,9 @@ class ExecutionEngine:
                 'error': f"{exc_type.__name__}: {str(e)}",
                 'traceback': full_traceback
             }
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_handler)
     
     def _save_trace(self, trace_file, candidate, error):
         """save full execution trace as html"""
@@ -285,7 +296,10 @@ class ProgramRewriter:
                 temperature=self.config.temperature_rewrite
             )
             with open(output_dir / f"rewrite_response_retry{retry}.txt", 'w') as f:
-                f.write(response)
+                f.write(response["content"] or "")
+            with open(output_dir / f"rewrite_response_retry{retry}.json", "w") as f:
+                json.dump(response, f, indent=2, ensure_ascii=False)
+            response = response["content"]
             rewritten_code = extract_code(response, return_nan=False)
             if tool.name not in rewritten_code:
                 self.logger.warning(f"Rewritten code does not use tool {tool.name}")
@@ -296,6 +310,8 @@ class ProgramRewriter:
             else:
                 self.logger.warning(f"Invalid Python syntax in rewrite attempt {retry}")
                 return None
+        except APIConnectionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to rewrite program: {e}")
             return None
@@ -309,9 +325,9 @@ class ProgramRewriter:
 
 class ExecutionValidator:
     """validates that rewritten programs execute successfully"""
-    def __init__(self, config):
+    def __init__(self, config, execution_engine):
         self.config = config
-        self.execution_engine = ExecutionEngine(config)
+        self.execution_engine = execution_engine
         self.rewriter = ProgramRewriter(config)
         self.logger = get_logger(__name__)
     

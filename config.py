@@ -13,7 +13,6 @@ class PipelineConfig:
     image_path: str
     models_path: str
     results_path: str
-    api_key_path: str
     # model selection for predefined apis
     vqa_model: str
     grounding_model: str
@@ -77,6 +76,8 @@ class PipelineConfig:
     debug: bool
     execution_timeout: int
     save_exe_trace: bool
+    stop_iteration: int | None
+    stop_position: int | None
     
     def __post_init__(self):
         self.run_id = self.resume_run_id
@@ -109,7 +110,6 @@ def create_config_from_args(args) -> PipelineConfig:
         image_path=args.image_path,
         models_path=args.models_path,
         results_path=args.results_path,
-        api_key_path=args.api_key_path,
         # model selection for predefined apis
         vqa_model=args.vqa_model,
         grounding_model=args.grounding_model,
@@ -172,5 +172,7 @@ def create_config_from_args(args) -> PipelineConfig:
         resume_run_id=args.resume,
         debug=args.debug,
         execution_timeout=args.execution_timeout,
-        save_exe_trace=args.save_exe_trace
+        save_exe_trace=args.save_exe_trace,
+        stop_iteration=args.stop_iteration,
+        stop_position=args.stop_position,
     )

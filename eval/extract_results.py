@@ -57,6 +57,9 @@ def extract_best_program_info(question_dir):
 
 def load_example_library(results_dir):
     examples_path = results_dir / "state" / "examples.json"
+    committed = results_dir / "state/.commit/examples.json"
+    if committed.exists():
+        examples_path = committed
     examples_data = load_json_safe(examples_path)
     if not examples_data:
         return {}
@@ -68,27 +71,39 @@ def load_example_library(results_dir):
 
 def load_tools(results_dir):
     tools_path = results_dir / "state" / "tools.json"
+    committed = results_dir / "state/.commit/tools.json"
+    if committed.exists():
+        tools_path = committed
     tools_data = load_json_safe(tools_path)
     return tools_data if tools_data else []
 
-def extract_iteration_data(results_dir, question_idx, num_iterations):
+def extract_iteration_data(results_dir, question_idx, num_iterations, completed):
     iteration_data = {}
     for iter_num in range(1, num_iterations + 1):
-        iter_dir = results_dir / f"iterations/iteration_{iter_num}/questions/q_{question_idx}"
-        if iter_dir.exists():
-            best_program_info = extract_best_program_info(iter_dir)
-            iteration_data[f"iter{iter_num}"] = best_program_info
+        question_dir = (
+            results_dir / f"iterations/iteration_{iter_num}/questions/q_{question_idx}"
+        )
+        if question_idx in completed.get(str(iter_num), []):
+            info = extract_best_program_info(question_dir)
+            info["status"] = "completed"
+        else:
+            info = {"status": "incomplete" if question_dir.exists() else "not_started"}
+        iteration_data[f"iter{iter_num}"] = info
     return iteration_data
 
 
 def compile_metadata(question_idx, iteration_data, example_library):
     metadata = {
-        "iterations_processed": len(iteration_data),
+        "iterations_processed": sum(
+            info["status"] == "completed" for info in iteration_data.values()
+        ),
         "execution_success_by_iteration": {},
         "quality_ratings": {},
         "in_example_library": question_idx in example_library
     }
     for iter_key, iter_info in iteration_data.items():
+        if iter_info["status"] != "completed":
+            continue
         metadata["execution_success_by_iteration"][iter_key] = iter_info.get("execution_success", False)
         if iter_info.get("quality_rating") is not None:
             metadata["quality_ratings"][iter_key] = iter_info["quality_rating"]
@@ -105,7 +120,7 @@ def compile_metadata(question_idx, iteration_data, example_library):
             metadata["update_types"] = [u["update_type"] for u in example["update_history"]]
     return metadata
 
-def extract_results(run_id, results_path, output_file):
+def extract_results(run_id, results_path):
     results_dir = Path(results_path) / run_id
     print(f"Loading data from {results_dir}...")
     questions_path = results_dir / "sampled_questions.json"
@@ -119,22 +134,37 @@ def extract_results(run_id, results_path, output_file):
     print(f"Found {len(example_library)} examples in library")
     print(f"Found {len([t for t in tools if t['level'] > 0])} learned tools")
     print(f"Found {len([t for t in tools if t['level'] > 0 and not t['is_deprecated']])} active (not deprecated) learned tools")
-    iterations_dir = results_dir / "iterations"
-    num_iterations = len(list(iterations_dir.glob("iteration_*")))
+    with open(results_dir / "metadata.json") as f:
+        config = json.load(f)
+    checkpoint_path = results_dir / "state/checkpoint.json"
+    commit_checkpoint = results_dir / "state/.commit/checkpoint.json"
+    if commit_checkpoint.exists():
+        checkpoint_path = commit_checkpoint
+    if checkpoint_path.exists():
+        with open(checkpoint_path) as f:
+            checkpoint = json.load(f)
+        completed = checkpoint["completed_questions"]
+    else:
+        checkpoint = {}
+        completed = {}
+    num_iterations = config["num_iterations"]
     print(f"Found {num_iterations} iterations")
     results = []
     for question in questions_data:
         question_idx = question["question_index"]
-        iteration_data = extract_iteration_data(results_dir, question_idx, num_iterations)
+        iteration_data = extract_iteration_data(results_dir, question_idx, num_iterations, completed)
         programs = {}
         pred_answers = {}
         for iter_key, iter_info in iteration_data.items():
+            if iter_info["status"] != "completed":
+                continue
             programs[iter_key] = iter_info.get("program")
             pred_answers[iter_key] = iter_info.get("answer")
         metadata = compile_metadata(question_idx, iteration_data, example_library)
         metadata["iteration_details"] = {}
         for iter_key, iter_info in iteration_data.items():
             metadata["iteration_details"][iter_key] = {
+                "status": iter_info["status"],
                 "execution_success": iter_info.get("execution_success", False),
                 "quality_rating": iter_info.get("quality_rating"),
                 "tools_used": iter_info.get("tools_used", []),
@@ -158,9 +188,19 @@ def extract_results(run_id, results_path, output_file):
         "questions_in_library": len(example_library),
         "learned_tools": len([t for t in tools if t['level'] > 0]),
         "deprecated_tools": len([t for t in tools if t['is_deprecated']]),
-        "iterations": num_iterations
+        "iterations": num_iterations,
+        "progress": {
+            f"iter{i}": {
+                "planned": len(questions_data),
+                "completed": len(completed.get(str(i), [])),
+                "partial": len(completed.get(str(i), [])) != len(questions_data),
+            }
+            for i in range(1, num_iterations + 1)
+        },
+        "stop_iteration": checkpoint.get("stop_iteration"),
+        "stop_position": checkpoint.get("stop_position"),
     }
-    output_path = Path(output_file)
+    output_path = results_dir / "eval/extracted_results.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_data = {
         "summary": summary,
@@ -189,10 +229,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--run-id", type=str, required=True,
                         help="Run ID to extract results from")
-    parser.add_argument("--results-path", type=str, default="./results",
+    parser.add_argument("--results-path", type=str, default="./output",
                         help="Path to results directory")
-    parser.add_argument("--output-path", type=str, default="./eval/extracted_results",
-                        help="Path to output directory")
     args = parser.parse_args()
-    output_file = Path(args.output_path) / f"{args.run_id}.json"
-    extract_results(args.run_id, args.results_path, output_file)
+    extract_results(args.run_id, args.results_path)
