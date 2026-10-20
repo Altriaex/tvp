@@ -126,7 +126,7 @@ Each role reads its own environment variable: `TVP_PROGRAM_MODEL`,
 `TVP_MERGE_MODEL`, and `TVP_VQA_MODEL`. The corresponding explicit CLI argument
 wins over the environment value; each role defaults to `Qwen3.8-Flash-Next`.
 All roles share the existing service URL and key.
-The base URL is `http://10.1.110.29:30001/v1`; `EMPTY` is the placeholder for
+The base URL is `http://10.1.110.29:30000/v1`; `EMPTY` is the placeholder for
 the currently unauthenticated service. The former `api.key` file and
 `--api-key-path` option are no longer used.
 

@@ -9,6 +9,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
+import httpx
 from openai import OpenAI, APIConnectionError
 from FlagEmbedding import FlagModel
 
@@ -110,7 +111,7 @@ class LLMClient:
     @property
     def client(self):
         if self._client is None:
-            self._client = OpenAI()
+            self._client = OpenAI(timeout=httpx.Timeout(600.0, read=1800.0, connect=5.0))
         return self._client
 
     def generate(self, prompt, model, temperature=1.0, reasoning_effort='medium', max_retries=3):

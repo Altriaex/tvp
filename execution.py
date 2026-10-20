@@ -17,8 +17,8 @@ from logging_utils import get_logger, log_execution, log_tool_validation
 from predefined_apis import PredefinedModules
 from utils import LLMClient, extract_code, normalize_answer
 
-class TimeoutError(Exception):
-    pass
+class TimeoutError(BaseException):
+    """Escape ordinary generated-code and client retry exception handlers."""
 
 class ExecutionEngine:
     """executes programs sequentially"""
@@ -169,12 +169,25 @@ class ExecutionEngine:
                         f.write(f"{implementation}\n\n")
                     else:
                         f.write(f"{tool.signature}\n")
-                        # handle misaligned first line and second line
-                        impl_lines = implementation.split("\n")
-                        if not impl_lines[0].startswith('    '):
-                            if impl_lines[1].startswith('    '):
-                                implementation = '    ' + implementation
-                                implementation = textwrap.dedent(implementation)
+                        # Preserve valid nested blocks before applying the legacy
+                        # repair for a first line whose indentation was stripped.
+                        try:
+                            compile(
+                                tool.signature + '\n' + textwrap.indent(implementation, '    '),
+                                '<tool implementation>',
+                                'exec',
+                            )
+                        except IndentationError:
+                            impl_lines = [
+                                line for line in implementation.splitlines() if line.strip()
+                            ]
+                            if len(impl_lines) > 1 and not impl_lines[0].startswith('    '):
+                                if impl_lines[1].startswith('    '):
+                                    implementation = '    ' + implementation
+                                    implementation = textwrap.dedent(implementation)
+                        except SyntaxError:
+                            # Other generated-code errors belong to execution validation.
+                            pass
                         # indent implementation
                         indented = textwrap.indent(implementation, '    ')  
                         f.write(f"{indented}\n\n")
@@ -214,7 +227,7 @@ class ExecutionEngine:
             return None
         except APIConnectionError:
             raise
-        except Exception as e:
+        except (TimeoutError, Exception) as e:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
             full_traceback = ''.join(tb_lines)
